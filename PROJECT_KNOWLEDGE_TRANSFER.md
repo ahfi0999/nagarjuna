@@ -84,7 +84,7 @@ src/
 |   |-- dashboard/page.tsx
 |   |-- contacts/page.tsx
 |   |-- activities/page.tsx
-|   -- activities/[dealerId]/page.tsx
+|   `-- activities/[dealerId]/page.tsx
 |-- components/
 |   |-- layout/
 |   `-- ui/
@@ -173,7 +173,7 @@ Repository classes and singleton instances exist for Contacts, Activities, Atten
 Current status:
 
 - Contacts repository: implemented
-- Activities repository: implemented
+- Activities repository: implemented with pagination and search
 - Attendance repository: inert `Not implemented` stub
 - Tracking repository: dealer timeline implemented; original getTracking() stub preserved
 
@@ -252,15 +252,67 @@ The implementation uses one parameterized read-only query. The original `getTrac
 
 The Activities repository now returns `dealerId` as internal routing metadata. Dealer Name is the only clickable table field and links to `/activities/[dealerId]` with prefetch disabled.
 
+### Phase 8.6 - Activities Pagination
+
+Extended `src/server/repositories/activities.repository.ts`:
+
+- `getActivities(limit, offset)` — added `offset` parameter with validation (`Number.isInteger && >= 0`).
+- `getActivitiesCount()` — new method returning the total row count as `number`. PostgreSQL returns `COUNT(*)` as `bigint`; the method converts it with `Number()`.
+
+Both methods use the same INNER JOINs so the count always matches the row set.
+
+`src/app/activities/page.tsx`:
+
+- Reads `searchParams.page`.
+- Validates page: `Number.isInteger(rawPage) && rawPage >= 1` — any non-integer, negative, zero, decimal, or NaN input defaults to `1`.
+- Computes `offset = (page - 1) * PAGE_SIZE` where `PAGE_SIZE = 20`.
+- Calls both repository methods in parallel via `Promise.all`.
+- Computes `totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE))` to always show at least page 1 of 1 when there are no rows.
+- Renders Previous and Next `<Link prefetch={false}>` controls; disabled state uses `<span aria-disabled="true">` with `opacity-50 cursor-not-allowed`.
+- Preserves all existing table, dealer navigation, error handling, and empty state.
+
+### Phase 8.7 - Activities Search
+
+Extended `src/server/repositories/activities.repository.ts`:
+
+- `getActivities(limit, offset, search)` — added optional `search` parameter (default `''`).
+- `getActivitiesCount(search)` — extended with optional `search` parameter.
+
+Search implementation:
+
+- Trims the search value before use.
+- When `term` is empty, executes the original query with no WHERE clause (preserving all existing behaviour).
+- When `term` is non-empty, adds a parameterized WHERE block using PostgreSQL `ILIKE` for case-insensitive partial matching across four fields:
+  - `dealer."personName"`
+  - `salesperson."name"`
+  - `dealer."contactType"`
+  - `follow_up."notes"`
+- Pattern is `%term%`, passed as a parameterized value via `$queryRaw`.
+- Both `getActivities` and `getActivitiesCount` use the same branch logic so pagination always operates within the filtered result set.
+
+**Known incompatibility — `Prisma.sql` / `Prisma.empty`:**
+An attempt was made to use `Prisma.sql` and `Prisma.empty` to compose a single query template and avoid duplicating the SQL. This caused a runtime error (`Raw query failed. Code: 42601. Message: ERROR: syntax error at or near "$1"`). PostgreSQL received `$1` as a literal token at the end of the JOIN block because `$queryRaw` at this custom generated output path treats interpolated `Sql` objects as parameter values rather than SQL fragments. The fix is separate `if (!term)` branches — do not attempt `Prisma.sql`/`Prisma.empty` interpolation in `$queryRaw` in this project.
+
+`src/app/activities/page.tsx`:
+
+- Reads `searchParams.search` alongside `searchParams.page`.
+- Trims the search value on the page before passing it to repositories.
+- Renders a `<form method="get" action="/activities">` search bar above the table — plain HTML GET form, no Client Component, no Server Action.
+- Clear button uses `<Link href="/activities" prefetch={false}>` (not a raw `<a>` tag) for consistency.
+- Submitting the form navigates to `/activities?search=term`, which omits `page` and therefore always resets to page 1.
+- Previous and Next links include `&search=encodeURIComponent(search)` when search is active, preserving the filter across pages.
+- Section subtitle reflects search state: result count and search term when filtering, total and page otherwise.
+
 ## 7. Current Routes
 
-| Route         | Access        | Purpose                                              |
-| ------------- | ------------- | ---------------------------------------------------- |
-| `/login`      | Public        | Auth0 login entry                                    |
-| `/dashboard`  | Authenticated | Welcome and five newest contacts                     |
-| `/contacts`   | Authenticated | Up to twenty newest contacts                         |
-| `/activities` | Authenticated | Up to twenty newest follow-up activities             |
-| `/auth/*`     | Auth0 SDK     | Login, callback, logout, profile, and session routes |
+| Route                   | Access        | Purpose                                              |
+| ----------------------- | ------------- | ---------------------------------------------------- |
+| `/login`                | Public        | Auth0 login entry                                    |
+| `/dashboard`            | Authenticated | Welcome and five newest contacts                     |
+| `/contacts`             | Authenticated | Up to twenty newest contacts                         |
+| `/activities`           | Authenticated | Paginated follow-up activities with server-side search |
+| `/activities/[dealerId]`| Authenticated | Dealer tracking timeline with notes and images       |
+| `/auth/*`               | Auth0 SDK     | Login, callback, logout, profile, and session routes |
 
 The Activities list links Dealer Name to its dealer timeline. The dashboard does not yet contain an Activities navigation link.
 
@@ -333,61 +385,73 @@ The database also contains a separate `tasks` table, but no relationship is decl
 
 ## 10. Activities Repository
 
-Method:
+Current method signatures:
 
 ```ts
-activitiesRepository.getActivities((limit = 20));
+activitiesRepository.getActivities(limit = 20, offset = 0, search = '');
+activitiesRepository.getActivitiesCount(search = '');
 ```
 
-The method validates integer limits from 1 through 20.
+Validation:
+- `limit`: integer between 1 and 20.
+- `offset`: non-negative integer.
+- `search`: trimmed before use; empty string preserves no-WHERE behaviour.
 
-Current query:
+Queries (no search):
 
 ```sql
+-- getActivities
 SELECT
-  dealer."personName" AS "dealerName",
+  dealer."id"              AS "dealerId",
+  dealer."personName"      AS "dealerName",
   follow_up."followUpDate" AS "dateTime",
   dealer."contactType",
-  salesperson."name" AS "salesperson",
+  salesperson."name"       AS "salesperson",
   follow_up."notes"
 FROM "followUps" AS follow_up
-INNER JOIN "dealers" AS dealer
-  ON follow_up."dealerId" = dealer."id"
-INNER JOIN "users" AS salesperson
-  ON follow_up."userId" = salesperson."id"
-ORDER BY
-  follow_up."createdAt" DESC NULLS LAST,
-  follow_up."id" DESC
-LIMIT $1;
+INNER JOIN "dealers" AS dealer ON follow_up."dealerId" = dealer."id"
+INNER JOIN "users"   AS salesperson ON follow_up."userId" = salesperson."id"
+ORDER BY follow_up."createdAt" DESC NULLS LAST, follow_up."id" DESC
+LIMIT $1 OFFSET $2;
+
+-- getActivitiesCount
+SELECT COUNT(*) AS "count"
+FROM "followUps" AS follow_up
+INNER JOIN "dealers" AS dealer ON follow_up."dealerId" = dealer."id"
+INNER JOIN "users"   AS salesperson ON follow_up."userId" = salesperson."id";
 ```
 
-Returned contract:
+Queries (with search — WHERE block added, same joins and ordering):
 
-```ts
-type ActivityListItem = {
-  dealerId: number;
-  dealerName: string;
-  dateTime: string;
-  contactType: string;
-  salesperson: string;
-  notes: string | null;
-};
+```sql
+WHERE (
+  dealer."personName"     ILIKE $1
+  OR salesperson."name"   ILIKE $1
+  OR dealer."contactType" ILIKE $1
+  OR follow_up."notes"    ILIKE $1
+)
 ```
 
-The repository uses the shared Prisma singleton and tagged `$queryRaw`, contains one parameterized `SELECT`, does not use `SELECT *`, contains no filter on `followUps.delete`, and executes no query when imported. `dealerId` is returned only for routing and is not displayed as a visible column.
+Pattern value is `%term%`. All values are parameterized. No `SELECT *`, no writes.
+
+`dealerId` is returned only for routing and is not displayed as a visible column.
 
 ## 11. Activities Page
 
 `src/app/activities/page.tsx`:
 
 - Is an authenticated async Server Component.
-- Calls `activitiesRepository.getActivities(20)` exactly once.
-- Displays only Dealer Name, Date & Time, Contact Type, Salesperson, and Notes.
+- Reads `searchParams.page` and `searchParams.search`.
+- Validates page using `Number.isInteger(rawPage) && rawPage >= 1`; any invalid value defaults to `1`.
+- Trims search value; passes it to both repository methods.
+- Calls `getActivities` and `getActivitiesCount` in parallel via `Promise.all`.
+- Displays Dealer Name, Date & Time, Contact Type, Salesperson, and Notes.
+- Renders a plain HTML `<form method="get">` search bar; no Client Component or Server Action.
+- Clear uses `<Link href="/activities" prefetch={false}>`.
+- Previous and Next pagination links preserve the active search via `&search=...`.
 - Handles empty results and repository errors.
-- Includes Back to Dashboard and Logout controls.
-- Makes only Dealer Name clickable, linking to /activities/[dealerId] with prefetch disabled.
 - Uses no client component, API route, client fetch, or Server Action.
-- Contains no search, filters, pagination, create, edit, delete, export, bulk actions, row actions, or checkboxes.
+- Contains no filters, sorting, export, bulk actions, row actions, or checkboxes.
 
 ## 12. Dealer Activity Timeline
 
@@ -429,8 +493,8 @@ Queries executed per authenticated route render:
 
 - `/dashboard`: one contacts `SELECT`, limit 5.
 - `/contacts`: one contacts `SELECT`, limit 20.
-- /activities: one follow-up activities SELECT, limit 20.
-- /activities/[dealerId]: one dealer tracking timeline SELECT.
+- `/activities`: two parallel SELECTs — paginated activities and count — both optionally filtered by search.
+- `/activities/[dealerId]`: one dealer tracking timeline SELECT.
 - Attendance: no query; repository is a stub.
 - Tracking: timeline query implemented; original generic method remains a stub.
 
@@ -440,7 +504,7 @@ Schema investigations used metadata queries in sessions forced to `default_trans
 
 ## 14. Verification Status and Known Warnings
 
-After the Activities repository/UI revision, these commands passed:
+After Phase 8.7 implementation, these commands passed:
 
 ```bash
 npm run typecheck
@@ -450,19 +514,20 @@ npm run build
 
 The production build includes `/activities` and `/activities/[dealerId]` as dynamic server-rendered routes.
 
-Existing warnings:
+Existing warnings (present before Phase 8.6; unchanged):
 
 - Auth0's DPoP utility produces a dynamic dependency warning during bundling.
 - Next's internal build-time ESLint integration reports obsolete options.
 
 These are existing dependency warnings. Standalone `npm run lint` passes, and the production build exits successfully.
 
-An earlier incomplete install caused SWC lockfile patch warnings. The lockfile was regenerated and the failed SWC patch issue was resolved.
-
 ## 15. Known Issues
 
 - The dashboard source currently contains malformed fallback text (`ï¿½`) for some null contact values due to an earlier file-encoding problem. Fix this only in a separately authorized UI cleanup.
 - The dashboard currently links to Contacts but not Activities.
+- The Attendance repository is a stub that throws `Not implemented`. No Attendance page exists.
+- `trackingRepository.getTracking()` is a stub that throws `Not implemented`.
+- `Prisma.sql` / `Prisma.empty` interpolation into `$queryRaw` does not work in this project (see Phase 8.7 notes). Use separate query branches for conditional WHERE logic.
 - Update this KT file whenever a later phase changes repository queries, routes, or completed-module status.
 
 ## 16. Commands
@@ -501,3 +566,4 @@ prisma migrate ...
 10. Run typecheck, lint, and build after implementation.
 11. Report existing warnings separately from new errors.
 12. Do not silently continue to another phase.
+13. Do not attempt `Prisma.sql` / `Prisma.empty` interpolation inside `$queryRaw` — use separate query branches for conditional WHERE logic instead.

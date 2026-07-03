@@ -5,15 +5,37 @@ import { LogoutButton } from '@/features/auth/components/logout-button';
 import { auth0 } from '@/features/auth/server/auth0';
 import { activitiesRepository } from '@/server/repositories/activities.repository';
 
-export default async function ActivitiesPage() {
+const PAGE_SIZE = 20;
+
+type ActivitiesPageProps = {
+  searchParams: Promise<{ page?: string; search?: string }>;
+};
+
+export default async function ActivitiesPage({
+  searchParams,
+}: ActivitiesPageProps) {
   const session = await auth0.getSession();
 
   if (!session) {
     redirect('/login');
   }
 
+  const { page: pageParam, search: searchParam } = await searchParams;
+  const rawPage = Number(pageParam);
+  const page = Number.isInteger(rawPage) && rawPage >= 1 ? rawPage : 1;
+  const search = (searchParam ?? '').trim();
+  const offset = (page - 1) * PAGE_SIZE;
+
   try {
-    const activities = await activitiesRepository.getActivities(20);
+    const [activities, totalCount] = await Promise.all([
+      activitiesRepository.getActivities(PAGE_SIZE, offset, search),
+      activitiesRepository.getActivitiesCount(search),
+    ]);
+
+    const totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE));
+    const hasPrevious = page > 1;
+    const hasNext = page < totalPages;
+    const searchQuery = search ? `&search=${encodeURIComponent(search)}` : '';
 
     return (
       <main className="min-h-screen bg-muted/40">
@@ -38,11 +60,40 @@ export default async function ActivitiesPage() {
             </div>
           </header>
 
+          <form method="get" action="/activities" className="mt-6">
+            <div className="flex gap-2">
+              <input
+                type="search"
+                name="search"
+                defaultValue={search}
+                placeholder="Search dealer, salesperson, contact type, or notes…"
+                className="h-10 w-full max-w-sm rounded-md border border-input bg-background px-3 text-sm ring-offset-background placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+              />
+              <button
+                type="submit"
+                className="inline-flex h-10 items-center justify-center rounded-md border border-input bg-background px-4 text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+              >
+                Search
+              </button>
+              {search && (
+                <Link
+                  href="/activities"
+                  prefetch={false}
+                  className="inline-flex h-10 items-center justify-center rounded-md border border-input bg-background px-4 text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                >
+                  Clear
+                </Link>
+              )}
+            </div>
+          </form>
+
           <section className="mt-8 overflow-hidden rounded-lg border bg-card text-card-foreground shadow-sm">
             <div className="border-b px-5 py-4">
               <h2 className="text-lg font-semibold">All Activities</h2>
               <p className="mt-1 text-sm text-muted-foreground">
-                Showing up to 20 activities, newest first.
+                {search
+                  ? `${totalCount} result${totalCount === 1 ? '' : 's'} for "${search}" — page ${page} of ${totalPages}`
+                  : `Page ${page} of ${totalPages} — ${totalCount} total`}
               </p>
             </div>
 
@@ -92,6 +143,50 @@ export default async function ActivitiesPage() {
                 </table>
               </div>
             )}
+
+            <div className="flex items-center justify-between border-t px-5 py-4">
+              {totalCount > 0 && (
+                <p className="text-sm text-muted-foreground">
+                  Showing {offset + 1}–
+                  {Math.min(offset + activities.length, totalCount)} of{' '}
+                  {totalCount}
+                </p>
+              )}
+              <div className="ml-auto flex items-center gap-2">
+                {hasPrevious ? (
+                  <Link
+                    href={`/activities?page=${page - 1}${searchQuery}`}
+                    prefetch={false}
+                    className="inline-flex h-9 items-center justify-center rounded-md border border-input bg-background px-4 text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                  >
+                    Previous
+                  </Link>
+                ) : (
+                  <span
+                    aria-disabled="true"
+                    className="inline-flex h-9 cursor-not-allowed items-center justify-center rounded-md border border-input bg-background px-4 text-sm font-medium text-muted-foreground opacity-50"
+                  >
+                    Previous
+                  </span>
+                )}
+                {hasNext ? (
+                  <Link
+                    href={`/activities?page=${page + 1}${searchQuery}`}
+                    prefetch={false}
+                    className="inline-flex h-9 items-center justify-center rounded-md border border-input bg-background px-4 text-sm font-medium transition-colors hover:bg-accent hover:text-accent-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                  >
+                    Next
+                  </Link>
+                ) : (
+                  <span
+                    aria-disabled="true"
+                    className="inline-flex h-9 cursor-not-allowed items-center justify-center rounded-md border border-input bg-background px-4 text-sm font-medium text-muted-foreground opacity-50"
+                  >
+                    Next
+                  </span>
+                )}
+              </div>
+            </div>
           </section>
         </div>
       </main>
